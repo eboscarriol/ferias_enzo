@@ -1,0 +1,100 @@
+#atualizar linha 92 com seu email e linha 74 com data e linha 97 com mes correspondente a data
+#library(googlesheets)
+library(XML)
+library(httr)
+library(jsonlite)
+library(RPostgreSQL)
+library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+
+drv = dbDriver("PostgreSQL")
+
+brcon = RPostgreSQL::dbConnect(  drv
+                                 , user = "simplic_nhu"
+                                 , password = "Cnuacspassword123"
+                                 , dbname = "staging"
+                                 , host = "eis-reporting-masterdb.enova.com"
+                                 , port = "5432")
+
+qry <-"---FUNIL COMPLETO PARCEIROS
+select
+    to_char(loan_application_date,'YYYY-MM-DD')::DATE as LOAN_APP_DATE,
+    --to_char(loan_funded_on,'YYYY-MM-DD')::date as FUNDED_DATE_ADOBE,
+    to_char(funded_date,'YYYY-MM-DD')::date as FUNDED_DATE,
+    --bai.customer_type,
+    source,
+    --bai.cpf,
+    bai.account_id,
+    bai.loan_application_id,
+    case when bli.returned_or_funding_failed_flag= 1 or loan_status = 'funding_failed' then 1 else 0 end as funding_failed_flag,
+    count(bai.loan_application_id)                                                                         as loan_app_cnt,
+    --sum(case when bai.credit_model_version ilike '%new_v%' then 1 else 0 end)                              as hit_cm,
+    --sum(case when last_ua.id is not null then 1 else 0 end)                                                as underwriting_approved,
+    sum(case when (last_ua.id is not null and bai.credit_model_version ilike '%new_v%') then 1 else 0 end) as underwriting_approved_by_final_models,
+    --sum(case when last_cv.id is not null then 1 else 0 end)                                                as contract_viewed,
+    sum(case when last_cs.id is not null then 1 else 0 end)                                                as contract_signed,
+    --sum(case when last_is.id is not null then 1 else 0 end) as issued_last_is,
+    sum(case when bli.operation_id is not null then 1 else 0 end) as issued,
+    --sum(funded) as issued_adobe,
+    sum(bli.funded_amount)                                  AS funded_amount
+    --bank_name as banco,
+    --bai.credit_tier,
+    --bai.credit_model_version,
+    --bai.lp_decision,
+    --ois.direct_debit_opt_in as opt_in_aut,
+
+from
+    nbox_simplic_sorocred.brazil_app_information bai
+    left join SIMPLIC_MARKETING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+        on a.loan_application_id = bai.loan_application_id
+    left join simplic_analytics.brazil_loans_information bli
+        on bli.loan_application_id = bai.loan_application_id
+    left join simplic_portfolio.loan_application_state_transitions last_ua
+        on last_ua.loan_application_id = bai.loan_application_id
+        and last_ua.event = 'underwriting_approve'
+    left join simplic_portfolio.loan_application_state_transitions last_cv
+        on last_cv.loan_application_id = bai.loan_application_id
+        and last_cv.event = 'ready_for_contract'
+    left join simplic_portfolio.loan_application_state_transitions last_cs
+        on last_cs.loan_application_id = bai.loan_application_id
+        and last_cs.event = 'sign_contract'
+    left join simplic_portfolio.loan_application_state_transitions last_lp
+        on last_lp.loan_application_id = bai.loan_application_id
+        and last_lp.event = 'entered_lp'
+    left join simplic_portfolio.loan_application_state_transitions last_is
+        on last_is.loan_application_id = bai.loan_application_id
+        and last_is.event = 'issue'
+    left join simplic_portfolio.loan_applications la
+        on bai.loan_application_id = la.loan_application_id
+        --left join sorcerer.opt_in_statuses ois on ois.loan_application_id=bai.loan_application_id
+    where 1 = 1
+      --and bai.loan_application_date::date >= (current_date - interval'5 day')
+    and bai.loan_application_date::date >= '2025-12-01' and bai.loan_application_date::date <= '2025-12-31'
+      --and bai.loan_application_date::date <= '2023-10-31'
+      --and a.loan_funded_on::date>= '2024-02-01'
+      --and bai.customer_type = 'New'
+      and la.loan_application_status_id !=19
+      and source in ('aff/kwai','kwai_simplified','kwai_simplified_partners')
+      --and source in ('aff/bom-pra-credito-email','bompracredito')
+      --and source in ('ame')
+      --and source in ('ecred_simplified')--,'aff/bom-pra-credito-email','finanzero_partner_simplified','bompracredito','easycredito1','easycredito_simplified','finanzero','finanzero_partner','aff/iq','iq_simplified')
+      --and channel in ('simplified_leads','leads','lead_partners')
+    --and favorite_touch in ('affiliate','leads')
+    --and channel in ('preapproved')
+    group by 1,2,3,4,5,6"
+
+
+ebs_auto <-dbGetQuery(brcon,qry)
+
+
+gs4_auth(email = "eboscarriol@enova.com")
+
+ebs_auto %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1vE-qbg4_MlW38LMSHScQ-d3iRlTfrWHC3QvS1S2jP8Y/edit?gid=0#gid=0"),
+    sheet = "December2025"
+  )
