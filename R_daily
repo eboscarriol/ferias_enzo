@@ -1,0 +1,324 @@
+#atualizar linhas 319 e 320 com seu usuario e senha
+
+list.of.packages <- c("htmlTable", "formattable","gt","dplyr","dplyr","mailR","rJava","RPostgreSQL","htmltools")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+library(lubridate)
+library(RPostgreSQL)
+library(rJava)
+library(mailR)
+library(dbplyr)
+library(dplyr)
+library(htmlTable)
+library(formattable)
+library(htmltools)
+library(gt)
+Sys.setenv(TZ='UTC')
+brcon <- dbConnect(PostgreSQL(), user = "simplic_nhu"
+                   , password = "Cnuacspassword123"
+                   , dbname = "staging"
+                   , host = "eis-reporting-masterdb.enova.com"
+                   , port = "5432"
+)
+qry <- sprintf(" with dates as (
+    select *
+    from
+    (
+        select dt1.date::date as cal_day,
+               min(dt2.date) as bus_day
+        from bi.dates_bycountry dt1
+                 left join bi.dates_bycountry dt2
+                           on dt1.country_name = dt2.country_name
+                               and dt2.business_day_flg = 'Y'
+                               --and dt1.nb_orb_ind = 'B'
+                               and dt2.date::date not in
+                                   ('2023-02-20','2023-02-21','2023-04-07','2023-04-21','2023-05-01','2023-06-08','2023-09-07','2023-10-12','2023-11-02','2023-11-15','2023-12-25','2023-12-29','2024-01-01','2024-11-15','2024-11-20') --include holidays in this row
+                               and dt2.date >= dt1.date
+                               and dt2.date < dt1.date + 10
+        where 1 = 1
+                               and dt2.date < dt1.date + 10
+          and dt1.country_name = 'BR'
+          and dt1.date >= current_date - 35
+          and dt1.date <= (date_trunc('month', current_date) + interval '1 month' - interval '1 day') ::date
+        group by 1
+    )sq
+    where bus_day >= date_trunc('month', current_date)
+),
+days_gone as
+(
+    select
+        count(distinct (case when bus_day <= current_date then bus_day end ) )  || ' of ' ||
+        count(distinct bus_day)  as days_gone
+    from dates
+),
+loans as
+(
+    select
+        l.account_id,
+        (l.created_at + interval '4 hours') ::date as loan_date,
+        amount as orgination_amount,
+        bank_name,
+        case
+        when inputs ->> 'relending_flag' = 'true' then '4_Relending'
+        when equation_id = 101 then '1_New'
+        when equation_id = 104 then '2_Existing'
+        when equation_id = 168 then '3_Refinance'
+        else 'others'
+        end as customer_type
+    from simplic_portfolio.loans l
+    join simplic_portfolio.loan_statuses ls using (loan_status_id)
+    join simplic_portfolio.loan_applications la using (loan_number)
+    --join portfolio.loan_agreements lag using (loan_number)
+    join simplic_portfolio.underwriting_decisions ud on ud.loan_application_id = la.loan_application_id
+    left join simplic_portfolio.equation_results er on er.underwriting_decision_id = ud.underwriting_decision_id
+    and equation_id in (101, 104, 168)
+    left join identity.bank_account_history bah on bah.account_id = l.account_id
+    and valid_to_date is null
+    left join identity.bank_accounts using (bank_account_id)
+    left join identity.routing_numbers using (routing_number_id)
+    left join identity.banks using (bank_id)
+    where 1=1
+    and lender_id = 4
+    and l.created_at > date_trunc('month', current_date) - Interval '5 days'
+    and loan_status <> 'funding_failed'
+),
+daily as
+(
+    select
+        bus_day,
+        customer_type,
+        count(distinct account_id) as funded_d,
+        sum(orgination_amount) originations_d
+    from loans
+    join dates on cal_day = loan_date
+    where bus_day >= date_trunc('month', current_date)
+    group by 1,2
+    order by 1 desc, 2
+),
+month_to_date as
+(
+    select  customer_type,
+        avg(funded_d) ::int daily_average,
+        sum(funded_d) as funded_mtd,
+        sum(originations_d) originations_mtd
+    from daily
+    where bus_day >= date_trunc('month', current_date)
+    group by 1
+),
+daily_bank as
+(
+    select
+        bus_day,
+        case
+            when customer_type = '1_New' then 'New'
+            when customer_type = '4_Relending' then 'Relending'
+            else 'Exitsing + Refin'
+        end as customer_type,
+        case when bank_name = 'ITAÚ UNIBANCO S.A.' then 'ITAÚ'
+             when bank_name = 'CAIXA ECONOMICA FEDERAL' then 'CAIXA'
+             when bank_name = 'BANCO SANTANDER (BRASIL) S.A.' then 'SANTANDER'
+             when bank_name = 'BANCO BRADESCO S.A.' then 'BRADESCO'
+             else bank_name
+        end as bank_name,
+        count(*) funded_d,
+        sum(orgination_amount) originations_d
+    from loans
+    join dates on cal_day = loan_date
+    group by 1,2,3
+    order by 1 desc, 2
+),
+month_to_date_bank as
+(
+    select
+        customer_type, bank_name,
+        avg(funded_d) ::int daily_average,
+        sum(funded_d) as funded_mtd,
+        sum(originations_d) originations_mtd
+    from daily_bank
+    where bus_day >= date_trunc('month', current_date)
+    group by 1,2
+)
+ select
+  customer_type, bus_day as day, days_gone,
+  funded_d, daily_average, funded_mtd as mtd,
+  originations_d, originations_mtd
+ from daily
+ join month_to_date using (customer_type)
+ cross join days_gone
+ order by 2 desc,1
+               ")
+    qry1 <- sprintf("with dates as (
+    select *
+    from
+    (
+        select dt1.date::date as cal_day,
+               min(dt2.date) as bus_day
+        from bi.dates_bycountry dt1
+                 left join bi.dates_bycountry dt2
+                           on dt1.country_name = dt2.country_name
+                               and dt2.business_day_flg = 'Y'
+                               --and dt1.nb_orb_ind = 'B'
+                               and dt2.date::date not in
+                                   ('2023-02-20','2023-02-21','2023-04-07','2023-04-21','2023-05-01','2023-06-08','2023-09-07','2023-10-12','2023-11-02','2023-11-15','2023-12-25','2023-12-29','2024-01-01','2024-11-15','2024-11-20') --include holidays in this row
+                               and dt2.date >= dt1.date
+                               and dt2.date < dt1.date + 10
+        where 1 = 1
+                               and dt2.date < dt1.date + 10
+          and dt1.country_name = 'BR'
+          and dt1.date >= current_date - 35
+          and dt1.date <= (date_trunc('month', current_date) + interval '1 month' - interval '1 day') ::date
+        group by 1
+    )sq
+    where bus_day >= date_trunc('month', current_date)
+),
+days_gone as
+(
+    select
+        count(distinct (case when bus_day <= current_date then bus_day end ) )  || ' of ' ||
+        count(distinct bus_day)  as days_gone
+    from dates
+),
+loans as
+(
+    select
+        l.account_id,
+        (l.created_at + interval '4 hours') ::date as loan_date,
+        amount as orgination_amount,
+        bank_name,
+        case
+        when inputs ->> 'relending_flag' = 'true' then '4_Relending'
+        when equation_id = 101 then '1_New'
+        when equation_id = 104 then '2_Existing'
+        when equation_id = 168 then '3_Refinance'
+        else 'others'
+        end as customer_type
+    from simplic_portfolio.loans l
+    join simplic_portfolio.loan_statuses ls using (loan_status_id)
+    join simplic_portfolio.loan_applications la using (loan_number)
+    --join portfolio.loan_agreements lag using (loan_number)
+    join simplic_portfolio.underwriting_decisions ud on ud.loan_application_id = la.loan_application_id
+    left join simplic_portfolio.equation_results er on er.underwriting_decision_id = ud.underwriting_decision_id
+    and equation_id in (101, 104, 168)
+    left join identity.bank_account_history bah on bah.account_id = l.account_id
+    and valid_to_date is null
+    left join identity.bank_accounts using (bank_account_id)
+    left join identity.routing_numbers using (routing_number_id)
+    left join identity.banks using (bank_id)
+    where 1=1
+    and lender_id = 4
+    and l.created_at > date_trunc('month', current_date) - Interval '5 days'
+    and loan_status <> 'funding_failed'
+),
+daily as
+(
+    select
+        bus_day,
+        customer_type,
+        count(distinct account_id) as funded_d,
+        sum(orgination_amount) originations_d
+    from loans
+    join dates on cal_day = loan_date
+    where bus_day >= date_trunc('month', current_date)
+    group by 1,2
+    order by 1 desc, 2
+),
+month_to_date as
+(
+    select  customer_type,
+        avg(funded_d) ::int daily_average,
+        sum(funded_d) as funded_mtd,
+        sum(originations_d) originations_mtd
+    from daily
+    where bus_day >= date_trunc('month', current_date)
+    group by 1
+),
+daily_bank as
+(
+    select
+        bus_day,
+        case
+            when customer_type = '1_New' then 'New'
+            else 'Existing + Refin + Relending'
+        end as customer_type,
+        case when bank_name = 'ITAÚ UNIBANCO S.A.' then 'ITAÚ'
+             when bank_name = 'CAIXA ECONOMICA FEDERAL' then 'CAIXA'
+             when bank_name = 'BANCO SANTANDER (BRASIL) S.A.' then 'SANTANDER'
+             when bank_name = 'BANCO BRADESCO S.A.' then 'BRADESCO'
+             else bank_name
+        end as bank_name,
+        count(*) funded_d,
+        sum(orgination_amount) originations_d
+    from loans
+    join dates on cal_day = loan_date
+    group by 1,2,3
+    order by 1 desc, 2
+),
+month_to_date_bank as
+(
+    select
+        customer_type, bank_name,
+        avg(funded_d) ::int daily_average,
+        sum(funded_d) as funded_mtd,
+        sum(originations_d) originations_mtd
+    from daily_bank
+    where bus_day >= date_trunc('month', current_date)
+    group by 1,2
+)
+select
+    customer_type, bank_name, bus_day as day,  days_gone,
+    funded_d, daily_average, funded_mtd as mtd,
+    originations_d, originations_mtd
+from daily_bank
+join month_to_date_bank using (customer_type,bank_name)
+cross join days_gone
+order by 3 desc,1,2
+")
+    dados1<-dbGetQuery(brcon, enc2utf8(qry1))
+    dados<-dbGetQuery(brcon, enc2utf8(qry))
+    dados_day<-dados %>% filter(dados$day == today())
+    dados1_day_new<-dados1 %>% filter(dados1$day == today()&dados1$customer_type=='New')
+    dados1_day_exi<-dados1 %>% filter(dados1$day == today()&dados1$customer_type=='Existing + Refin + Relending')
+    #cria a tabela e o html da primeira tabela (daily volume)
+    daily_volume_html<-dados_day%>%gt(dados_day,rowname_col ="a")%>%
+      fmt_currency(columns = c(originations_d,originations_mtd),currency = "BRL")%>%
+      cols_align("center")%>%
+      tab_header(title="Daily Volume")%>%
+      tab_options(table.background.color = "beige",data_row.padding = px(1))%>%
+      as_raw_html()
+    #cria a tabela e o html da segunda tabela (daily volume por banco)
+    volume_por_banco_html<-dados1_day_new%>%gt(dados1_day_new,rowname_col ="a")%>%
+      fmt_currency(columns = c(originations_d,originations_mtd),currency = "BRL")%>%
+      cols_align("center")%>%
+      tab_header(title="Daily Volume by Bank")%>%
+      tab_options(table.background.color = "azure",data_row.padding = px(1))%>%
+      as_raw_html()
+    #cria a tabela e o html da terceira tabela (daily volume por banco exist e refin)
+    volume_por_banco_exis_html<-dados1_day_exi%>%gt(dados1_day_exi,rowname_col ="a")%>%
+      fmt_currency(columns = c(originations_d,originations_mtd),currency = "BRL")%>%
+      cols_align("center")%>%
+      tab_header(title="Daily Volume by Bank (Exist + Refin + Relending)")%>%
+      tab_options(table.background.color = "honeydew",data_row.padding = px(1))%>%
+      as_raw_html()
+    #criar o html do email
+    html_body <- sprintf("<p> Hello, here is Simplic's Daily Volume
+<br></br>
+%s
+<br><br></br></br>
+%s
+<br><br></br></br>
+%s
+",daily_volume_html,volume_por_banco_html,volume_por_banco_exis_html)#,funil_html)
+    xx<-Sys.Date()
+    too<- c("mhollender@enova.com","brazil_marketing@enova.com")
+    send.mail(from = "eboscarriol@enova.com",
+              to = too,
+              subject=sprintf('Daily Volume - Simplic %s', xx) ,
+              body = html_body,
+              html = TRUE,
+              smtp = list(host.name = "smtp.gmail.com", port = 465,
+                          user.name = "eboscarriol@enova.com",
+                          passwd = "kqru jffp fpmp fjna", ssl = TRUE),
+              authenticate = TRUE,
+              send = TRUE)
+    print("email enviado")
+    
