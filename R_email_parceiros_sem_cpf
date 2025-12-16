@@ -1,0 +1,90 @@
+#relatorio parceiros, sem CPF - atualizar email e senha na linha 87/88
+library(RPostgreSQL)
+sender <- "simplic@enova.com"
+brcon <- dbConnect(PostgreSQL(), user = "simplic_nhu"
+                   , password = "Cnuacspassword123"
+                   , dbname = "staging"
+                   , host = "eis-reporting-masterdb.enova.com"
+                   , port = "5432")
+setwd ('C:/R/Analítico Parceiros')
+library(rJava)
+library(mailR)
+library(stringr)
+dados <- read.table(file = 'Email_Parceiros_2024_bpc_semcpf.txt' ,header=TRUE, sep=";")
+dados$id <- seq(1,nrow(dados))
+dat <- data.frame()
+for (i in dados$id){
+  dat <- data.frame()
+  parceiros <- toString(dados$Parceiro[dados$id==i])
+  xx<- substr(parceiros,5,12)
+  parc_sep <- str_split(parceiros, ",")[[1]]
+  qtd_parc <- seq(1,str_count(parceiros, ",")+1)
+  
+  for (t in qtd_parc) 
+  {
+    nome<- parc_sep[[t]]
+    
+    qry <- sprintf("
+    select
+          to_char(loan_application_date,'YYYY-MM-DD')::DATE as data_pedido,
+          funded_date::Date as DATA_DEPOSITO_EMPRESTIMO,
+          case when source in ('bompracredito', 'bompracreditompracredito') then 'bompracredito'
+          when source in ('easycredito1', 'easycredito') then 'easycredito'
+          when source in ('finanzero_partner_simplified', 'finanzero_partner','finanzero') then 'finanzero'
+            --when source in ('aff/iq', 'iq_simplified') then 'iq-consumidor'
+          else source end as ORIGEM,
+          --source,
+          case when channel in ('organic') then 'organic_url_redirect' else channel end as CANAL,
+          --bai.cpf,
+          bai.account_id,
+          sum(case when bli.operation_id is not null then 1 else 0 end) as QTD_EMPREST_DEPOSITADO,
+          sum(bli.funded_amount)                                  AS VALOR_DEPOSITADO
+    from nbox_simplic_sorocred.brazil_app_information bai
+        left join SIMPLIC_MARKETING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+        on a.loan_application_id = bai.loan_application_id
+        left join simplic_analytics.brazil_loans_information bli
+        on bli.loan_application_id = bai.loan_application_id
+        left join simplic_portfolio.loan_application_state_transitions last_is
+        on last_is.loan_application_id = bai.loan_application_id
+        and last_is.event = 'issue'
+        left join simplic_portfolio.loan_applications la
+        on bai.loan_application_id = la.loan_application_id
+                   where source like '%s'
+                   and brand_key = 51
+                   and bli.returned_or_funding_failed_flag!= 1
+                   and loan_status != 'funding_failed'
+                   and la.loan_application_status_id !=19
+                   and extract(month from funded_date::date) = extract(month from current_date::date)
+                   and extract(year from funded_date::date) = extract(year from current_date::date)
+                   group by 1,2,3,4,5--,6,7
+                   order by 2 DESC",nome)
+    
+    exec_nome<-dbGetQuery(brcon,qry)
+    output <- rbind(dat, exec_nome)
+    dat<-output
+  }
+  write.csv2(dat, file = sprintf('Analitico_%s.csv', xx), row.names = FALSE)
+  emails <- toString(dados$Email[dados$id==i])
+  emails_sep <- str_split(emails, ",")[[1]]
+  qtd_emails <- seq(1,str_count(emails, ",")+1)
+  
+  for (t in qtd_emails) 
+  {
+    too<- emails_sep[[t]]
+    rJava::.jinit()
+    rJava::.jcall("java/lang/System","S","setProperty", "mail.smtp.ssl.protocols", "TLSv1.2")
+    send.mail(from = sender,
+              to = too,
+              subject="Simplic: relatorio analitico mes",
+              body = "Segue relatorio analitico do mes.",
+              smtp = list(host.name = "smtp.gmail.com", port = 465,
+                          user.name = "eboscarriol@enova.com",
+                          passwd = "kqru jffp fpmp fjna", ssl = TRUE),
+              authenticate = TRUE,
+              send = TRUE,
+              attach.files =sprintf('Analitico_%s.csv', xx))
+    print(nome)
+    print(too)
+  }
+  
+}
