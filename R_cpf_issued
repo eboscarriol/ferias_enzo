@@ -1,0 +1,79 @@
+#atualizar linha 72 com seu email 
+#esse arquivo atualiza os empréstimos com atribuição adobe no arquivo google sheet CPF | Issued | Invoices - Simplic, para calcular CPF
+
+
+#library(googlesheets)
+library(XML)
+library(httr)
+library(jsonlite)
+library(RPostgreSQL)
+library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+
+drv = dbDriver("PostgreSQL")
+
+brcon = RPostgreSQL::dbConnect(  drv
+                                 , user = "simplic_nhu"
+                                 , password = "Cnuacspassword123"
+                                 , dbname = "staging"
+                                 , host = "eis-reporting-masterdb.enova.com"
+                                 , port = "5432")
+
+qry <-"
+select
+funded_date::Date  as funded_date,
+to_char(funded_date,'YYYY') as funded_year,
+to_char(funded_date,'MM') as funded_month,
+to_char(funded_date,'DD') as funded_day,
+bai.customer_type,
+favorite_touch_agg,
+favorite_touch,
+favorite_campaign1,
+favorite_campaign2,
+favorite_campaign3,
+case when ls.loan_status = 'funding_failed' then 1 else 0 end as funding_failed_flag,
+case when funding_type_id =1 then 'full_funding'
+when funding_type_id =4 then 'top_up'
+when funding_type_id =5 then 'lmp'
+when funding_type_id =6 then 'relending'
+else 'other'
+end as funding_type,
+--bank_name as banco,
+--bai.credit_tier,
+sum(case when bli.operation_id is not null then 1 else 0 end) as emprestimo_emitido,
+sum(bli.funded_amount) as valor_depositado
+from nbox_simplic_sorocred.brazil_app_information bai
+left join SIMPLIC_MARKETING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+on a.loan_application_id = bai.loan_application_id
+left join simplic_analytics.brazil_loans_information bli
+on bli.loan_application_id = bai.loan_application_id
+left join simplic_portfolio.loan_applications la
+on bai.loan_application_id = la.loan_application_id
+left join simplic_portfolio.loans lo
+on la.loan_number = lo.loan_number
+left join simplic_portfolio.loan_statuses ls
+on ls.loan_status_id = lo.loan_status_id
+left join sorcerer.loan_application_attributes laa
+on bai.loan_application_id = laa.loan_application_id
+where 1=1
+and funded_date >= (current_date - interval'90 day') 
+--and favorite_touch = 'display'
+and la.loan_application_status_id !=19
+--and bai.customer_type = 'New'
+group by 1,2,3,4,5,6,7,8,9,10,11,12"
+
+
+ebs_auto <-dbGetQuery(brcon,qry)
+
+
+gs4_auth(email = "eboscarriol@enova.com")
+
+ebs_auto %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1PaCavPeGHAtRVCjUHcQeG7dNZEk-5--QKeNwgt1T9t4/edit?gid=0#gid=0"),
+    sheet = "issued_cpf"
+  )
