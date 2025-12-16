@@ -1,0 +1,322 @@
+# Rodar sempre no mês seguinte do fechamento
+
+# Instalação (se necessário):
+# install.packages(c("DBI","RPostgres","openxlsx","glue","mailR","stringr"))
+# (mailR requer Java instalado e compatível com seu R)
+
+library(DBI)
+library(RPostgres)
+library(openxlsx)
+library(glue)
+library(mailR)
+library(stringr)
+library(rJava)
+
+# ==========================
+# 1) Datas e caminhos
+# ==========================
+data_referencia <- as.Date(format(Sys.Date(), "%Y-%m-01")) - 1
+prefixo_data <- format(data_referencia, "%Y%m")
+
+pasta_destino <- "C:/R/fechamento_parceiros_leads"
+
+inicio_mes <- format(as.Date(format(data_referencia, "%Y-%m-01")), "%Y-%m-%d")
+fim_mes    <- format(data_referencia, "%Y-%m-%d")
+
+# ==========================
+# 2) Conexão com o PostgreSQL
+# ==========================
+con <- dbConnect(
+  RPostgres::Postgres(),
+  dbname = "staging",
+  host   = "eis-reporting-masterdb.enova.com",
+  port   = 5432,
+  user   = "simplic_nhu",
+  password = "Cnuacspassword123"
+)
+
+# ==========================
+# 3) Query SQL com datas dinâmicas
+# ==========================
+query <- glue("
+SELECT
+    funded_date::Date as data_deposito,
+    CASE 
+        WHEN source IN ('bompracredito','bompracredito_simplified_partners','aff/bom-pra-credito-email') THEN 'bompracredito'
+        WHEN source IN ('easycredito1','easycredito') THEN 'easycredito'
+        WHEN source IN ('finanzero_partner_simplified','finanzero_partner','finanzero') THEN 'finanzero'
+        ELSE source 
+    END as source,
+    channel,
+    bai.cpf,
+    bai.account_id,
+    bai.loan_application_id,
+    CASE 
+        WHEN bli.returned_or_funding_failed_flag = 1 OR loan_status = 'funding_failed' THEN 'sim'
+        ELSE 'nao' 
+    END as devolvido_banco,
+    SUM(CASE WHEN bli.operation_id IS NOT NULL THEN 1 ELSE 0 END) as emprestimo_emitido,
+    SUM(bli.funded_amount) as valor_depositado
+FROM nbox_simplic_sorocred.brazil_app_information bai
+LEFT JOIN bi.adobe_fav_touch_attribution_fact a
+    ON a.loan_application_id = bai.loan_application_id
+LEFT JOIN simplic_analytics.brazil_loans_information bli
+    ON bli.loan_application_id = bai.loan_application_id
+LEFT JOIN simplic_portfolio.loan_application_state_transitions last_is
+    ON last_is.loan_application_id = bai.loan_application_id
+    AND last_is.event = 'issue'
+LEFT JOIN simplic_portfolio.loan_applications la
+    ON bai.loan_application_id = la.loan_application_id
+WHERE source IN (
+    'bompracredito',
+    'bompracredito_simplified_partners',
+    'aff/bom-pra-credito-email',
+    'aff/easycredito',
+    'easycredito1',
+    'easycredito_simplified',
+    'ecred_simplified',
+    'finanzero_partner_simplified',
+    'finanzero_partner',
+    'finanzero',
+    'aff/idinheiro',
+    'aff/iq',
+    'iq_simplified',
+    'jurosbaixos',
+    'aff/jurosbaixos',
+    'kwai_simplified_partners',
+    'kwai_simplified',
+    'aff/kwai',
+    'querodinheiroagora_simplified',
+    'aff/noverde'
+)
+AND funded_date::date >= '{inicio_mes}'
+AND funded_date::date <= '{fim_mes}'
+AND la.loan_application_status_id != 19
+GROUP BY 1,2,3,4,5,6,7
+ORDER BY 2 DESC
+")
+
+dados <- dbGetQuery(con, query)
+dbDisconnect(con)
+
+# ==========================
+# 4) Transformações e comissões
+# ==========================
+dados_filtrados <- subset(dados, devolvido_banco == "nao")
+
+grupos <- list(
+  kwai           = c('kwai_simplified_partners','kwai_simplified','aff/kwai'),
+  iq             = c('aff/iq','iq_simplified'),
+  bompracredito  = c('bompracredito','bompracredito_simplified_partners','aff/bom-pra-credito-email'),
+  easycredito    = c('aff/easycredito','easycredito1','easycredito_simplified'),
+  finanzero      = c('finanzero_partner_simplified','finanzero_partner','finanzero'),
+  jurosbaixos    = c('jurosbaixos','aff/jurosbaixos')
+)
+
+comissoes <- list(
+  kwai                        = 0.07,
+  iq                          = 0.08,
+  bompracredito               = 0.085,
+  easycredito                 = 0.085,
+  finanzero                   = 0.08,
+  jurosbaixos                 = 0.1,
+  querodinheiroagora_simplified = 0.08,
+  ecred_simplified            = 0.1,
+  "aff/noverde"               = 0.06
+)
+
+sources_agrupadas <- unlist(grupos)
+
+# ==========================
+# 5) Exporta arquivos por grupo
+# ==========================
+for (nome_grupo in names(grupos)) {
+  parceiros   <- grupos[[nome_grupo]]
+  dados_grupo <- subset(dados_filtrados, source %in% parceiros)
+  
+  valor_total    <- sum(dados_grupo$valor_depositado, na.rm = TRUE)
+  taxa_comissao  <- if (!is.null(comissoes[[nome_grupo]])) comissoes[[nome_grupo]] else 0
+  valor_comissao <- valor_total * taxa_comissao
+  
+  resumo <- data.frame(
+    total_emprestimos       = sum(dados_grupo$emprestimo_emitido, na.rm = TRUE),
+    valor_total_emprestimos = valor_total,
+    comissao_percentual     = taxa_comissao,
+    valor_comissao          = valor_comissao
+  )
+  
+  caminho_completo <- file.path(pasta_destino, paste0(prefixo_data, "_", nome_grupo, "_fechamento.xlsx"))
+  write.xlsx(list(Dados = dados_grupo, Resumo = resumo), file = caminho_completo, overwrite = TRUE)
+}
+
+# ==========================
+# 6) Exporta arquivos individuais (não agrupados)
+# ==========================
+sources_restantes <- setdiff(unique(dados_filtrados$source), sources_agrupadas)
+
+for (s in sources_restantes) {
+  dados_por_source <- subset(dados_filtrados, source == s)
+  
+  valor_total    <- sum(dados_por_source$valor_depositado, na.rm = TRUE)
+  taxa_comissao  <- if (!is.null(comissoes[[s]])) comissoes[[s]] else 0
+  valor_comissao <- valor_total * taxa_comissao
+  
+  resumo <- data.frame(
+    total_emprestimos       = sum(dados_por_source$emprestimo_emitido, na.rm = TRUE),
+    valor_total_emprestimos = valor_total,
+    comissao_percentual     = taxa_comissao,
+    valor_comissao          = valor_comissao
+  )
+  
+  source_formatada <- gsub("[^a-zA-Z0-9_-]", "_", s)
+  caminho_completo <- file.path(pasta_destino, paste0(prefixo_data, "_", source_formatada, "_fechamento.xlsx"))
+  write.xlsx(list(Dados = dados_por_source, Resumo = resumo), file = caminho_completo, overwrite = TRUE)
+}
+
+# ==========================
+# 7) Carrega planilha de e-mails (Excel)
+# ==========================
+caminho_emails_base <- "C:/R/fechamento_parceiros_leads"
+emails_df <- openxlsx::read.xlsx(file.path(caminho_emails_base, "emails_fechamento.xlsx"), sheet = 1)
+
+# saneamento colunas
+emails_df$Parceiro <- trimws(emails_df$Parceiro)
+emails_df$Email    <- trimws(emails_df$Email)
+if (!"CC"  %in% names(emails_df)) emails_df$CC  <- ""
+if (!"BCC" %in% names(emails_df)) emails_df$BCC <- ""
+
+# ==========================
+# 8) Funções auxiliares
+# ==========================
+eh_grupo <- function(chave, grupos) chave %in% names(grupos)
+
+caminho_arquivo_parceiro <- function(chave, grupos, pasta_destino, prefixo_data) {
+  if (eh_grupo(chave, grupos)) {
+    file.path(pasta_destino, paste0(prefixo_data, "_", chave, "_fechamento.xlsx"))
+  } else {
+    source_formatada <- gsub("[^a-zA-Z0-9_-]", "_", chave)
+    file.path(pasta_destino, paste0(prefixo_data, "_", source_formatada, "_fechamento.xlsx"))
+  }
+}
+
+# ==========================
+# 8.1) Helper: resumo por parceiro (para o corpo do e-mail)
+# ==========================
+resumo_parceiro <- function(chave, dados_filtrados, grupos, comissoes) {
+  # identifica se é grupo (ex.: "kwai", "iq", "bompracredito"...)
+  if (chave %in% names(grupos)) {
+    dados_chave <- subset(dados_filtrados, source %in% grupos[[chave]])
+    taxa <- if (!is.null(comissoes[[chave]])) comissoes[[chave]] else 0
+  } else {
+    dados_chave <- subset(dados_filtrados, source == chave)
+    taxa <- if (!is.null(comissoes[[chave]])) comissoes[[chave]] else 0
+  }
+  
+  n_emprestimos <- sum(dados_chave$emprestimo_emitido, na.rm = TRUE)
+  valor_total   <- sum(dados_chave$valor_depositado,   na.rm = TRUE)
+  valor_comm    <- valor_total * taxa
+  
+  fmt_brl <- function(x) formatC(as.numeric(x), format = "f", digits = 2,
+                                 big.mark = ".", decimal.mark = ",")
+  list(
+    n_emprestimos = n_emprestimos,
+    valor_total   = valor_total,
+    valor_comm    = valor_comm,
+    taxa          = taxa,
+    valor_total_fmt = paste0("R$ ", fmt_brl(valor_total)),
+    valor_comm_fmt  = paste0("R$ ", fmt_brl(valor_comm))
+  )
+}
+
+# ==========================
+# 9) Envio por e-mail (mailR - Gmail)
+# ==========================
+smtp_from <- "eboscarriol@enova.com"
+smtp_conf <- list(
+  host.name = "smtp.gmail.com",
+  port      = 465,
+  user.name = "eboscarriol@enova.com",
+  passwd    = "kqru jffp fpmp fjna",   # senha de app
+  ssl       = TRUE
+)
+
+# força TLSv1.2 em algumas JVMs
+rJava::.jinit()
+rJava::.jcall("java/lang/System","S","setProperty", "mail.smtp.ssl.protocols", "TLSv1.2")
+
+log_envio <- data.frame(
+  parceiro = character(),
+  arquivo  = character(),
+  enviado  = logical(),
+  mensagem = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_len(nrow(emails_df))) {
+  parceiro_key  <- emails_df$Parceiro[i]
+  destinatarios <- trimws(unlist(strsplit(emails_df$Email[i], ",")))
+  cc_vec        <- if (nzchar(emails_df$CC[i]))  trimws(unlist(strsplit(emails_df$CC[i], ",")))  else character(0)
+  bcc_vec       <- if (nzchar(emails_df$BCC[i])) trimws(unlist(strsplit(emails_df$BCC[i], ","))) else character(0)
+  
+  arquivo <- caminho_arquivo_parceiro(parceiro_key, grupos, pasta_destino, prefixo_data)
+  if (!file.exists(arquivo)) {
+    msg <- sprintf("Arquivo não encontrado para '%s': %s", parceiro_key, arquivo)
+    warning(msg)
+    log_envio <- rbind(log_envio, data.frame(parceiro=parceiro_key, arquivo=arquivo, enviado=FALSE, mensagem=msg))
+    next
+  }
+  
+  # --- NOVO: calcula o resumo do parceiro para colocar no corpo do e-mail ---
+  rsum <- resumo_parceiro(parceiro_key, dados_filtrados, grupos, comissoes)
+  
+  corpo_html <- glue("
+    Olá,<br><br>
+    Segue o fechamento de <b>{format(as.Date(data_referencia), '%m/%Y')}</b> para <b>{parceiro_key}</b>.<br>
+    Em anexo está o Excel com as abas <i>Dados</i> e <i>Resumo</i>.<br><br>
+
+    <b>Empréstimos emitidos:</b> {rsum$n_emprestimos}<br>
+    <b>Valor originado:</b> {rsum$valor_total_fmt}<br>
+    <b>Comissão{if (rsum$taxa > 0) glue(' ({round(100*rsum$taxa,2)}%)') else ''}:</b> {rsum$valor_comm_fmt}<br><br>
+
+    Qualquer dúvida, fico à disposição.<br><br>
+    <small>Este e-mail foi enviado automaticamente.</small>
+  ")
+  
+  ok <- TRUE
+  msg <- "OK"
+  
+  # envia um e-mail único para todos os destinatários daquele parceiro (com CC/BCC se houver)
+  tryCatch({
+    mailR::send.mail(
+      from         = smtp_from,
+      to           = destinatarios,
+      cc           = cc_vec,
+      bcc          = bcc_vec,
+      subject      = glue("Simplic: fechamento {prefixo_data} - {parceiro_key}"),
+      body         = corpo_html,
+      html         = TRUE,
+      smtp         = smtp_conf,
+      authenticate = TRUE,
+      send         = TRUE,
+      attach.files = arquivo
+    )
+  }, error = function(e) {
+    ok  <<- FALSE
+    msg <<- paste("Falha ao enviar para", parceiro_key, "->", e$message)
+    warning(msg)
+  })
+  
+  log_envio <- rbind(log_envio, data.frame(parceiro=parceiro_key, arquivo=arquivo, enviado=ok, mensagem=msg))
+}
+
+# ==========================
+# 10) Salva log
+# ==========================
+write.csv(
+  log_envio,
+  file = file.path(pasta_destino, paste0(prefixo_data, "_log_envio_emails.csv")),
+  row.names = FALSE
+)
+
+message("Envio concluído. Log em: ",
+        file.path(pasta_destino, paste0(prefixo_data, "_log_envio_emails.csv")))
