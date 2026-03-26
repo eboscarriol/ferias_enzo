@@ -1,0 +1,192 @@
+#library(googlesheets)
+library(XML)
+library(httr)
+library(jsonlite)
+#library(RPostgreSQL)
+#library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(DBI)
+library(odbc)
+
+# Conexão Snowflake
+con <- dbConnect(odbc::odbc(),
+                 Driver   = "SnowflakeDSIIDriver",   # depende do driver instalado
+                 Server   = "FRTUKBM-ENOVA.snowflakecomputing.com", # URL da sua instância
+                 UID      = "eboscarriol",
+                 authenticator = "externalbrowser",
+                 Database = "EIS_REPORTING_SF",
+                 Schema   = "PUBLIC",   # ajuste conforme necessário
+                 Warehouse= "REPORTING_WH", # ajuste conforme seu ambiente
+                 Role     = "EBOSCARRIOL_ROLE"   # opcional, depende da config do seu user
+)
+
+# Testar query
+dbGetQuery(con, "SELECT CURRENT_TIMESTAMP;")
+
+qry <-"select
+    bai.loan_application_date::date as app_date,
+    to_char(bai.loan_application_date,'YYYY') as ANO,
+    to_char(bai.loan_application_date,'MM') as MES,
+    to_char(bai.loan_application_date,'DD') as DIA,
+    bai.customer_type,
+
+    case
+        when bai.source = 'unknown' then 'sem atribuição'
+        when bai.source in ('dis/goog', 'dis/goog-2', 'dis/goog-3', 'dis/goog-4', 'dis/goog-5', 'dis/goog-6')
+            then 'display google'
+        when bai.source in ('dis/goog-dgen')
+            then 'display demandgen'
+        when bai.source in ('dis/fb', 'dis/ig', 'dis/meta')
+            then 'display meta'
+        when bai.source in (
+            'sms', 'sms/existing', 'sms/preapproved', 'whatsapp', 'whatsapp/wdraw',
+            'whatsapp/existing', 'whatsapp/preapproved', 'email/contract', 'email/drop',
+            'email/existing', 'email/preapproved', 'email/wdraw'
+        ) then 'portfolio'
+        when bai.source in ('ppc/simplic')
+            then 'ppc-brand'
+        when bai.source in (
+            'ppc/comp', 'ppc/credito-negativado', 'ppc/emprestimo', 'ppc/emprestimo-b',
+            'ppc/emprestimo-negativado', 'ppc/emprestimo-negativado-online',
+            'ppc/emprestimo-online', 'ppc/emprestimo-p', 'ppc/emprestimo-pessoal',
+            'ppc/emprestimo-rapido', 'ppc/emprestimo-pessoal-online'
+        ) then 'ppc-nonbrand'
+        when bai.source in (
+            'whatsapp-messenger', 'politica_de_privacidade', 'perguntas_frequentes',
+            'chat', 'como-funciona', 'fale-conosco', 'faq', 'quem_somos',
+            'simplic-emprestimo-seguro', 'termos', 'emprestimo-simplic-confiavel'
+        ) then 'seo brand'
+        when bai.source in (
+            'pix', 'cartao-credito', 'crefisa', 'emprestimo', 'emprestimo-banco-do-brasil',
+            'emprestimo-bmg', 'emprestimo-bradesco', 'emprestimo-caixa',
+            'emprestimo-consignado', 'emprestimo-facil', 'emprestimo-itau',
+            'emprestimo-online', 'emprestimo-para-aposentado',
+            'emprestimo-para-autonomo-negativado', 'emprestimo-para-negativado',
+            'emprestimo-para-negativado-assalariado', 'emprestimo-para-pensionista-inss',
+            'emprestimo-para-servidor-publico', 'emprestimo-pernambucanas',
+            'emprestimo-pessoal', 'emprestimo-santander', 'emprestimo-seguro',
+            'emprestimo-urgente', 'caixa', 'consulta-serasa-spc', 'itau',
+            'just-emprestimo', 'melhor-credito-pessoal', 'mobile-app',
+            'credito-negativado', 'mapa-do-site', 'vim'
+        ) then 'seo nonbrand'
+        when bai.source in (
+            'social/emprestimo-pessoal',
+            'social/emprestimo-para-negativado',
+            'facebook',
+            'instagram'
+        ) then 'social'
+        when bai.source in ('dis/goog-youtube', 'dis/youtube-video')
+            then 'youtube video'
+        else bai.source
+    end as source,
+
+    case
+        when bai.source = 'unknown' then 'sem atribuição'
+        when bai.source in ('dis/goog', 'dis/goog-2', 'dis/goog-3', 'dis/goog-4', 'dis/goog-5', 'dis/goog-6')
+            then 'display google'
+        when bai.source in ('dis/goog-dgen')
+            then 'display demandgen'
+        when bai.source in ('dis/fb', 'dis/ig', 'dis/meta')
+            then 'display meta'
+        when bai.source in (
+            'sms', 'sms/existing', 'sms/preapproved', 'whatsapp', 'whatsapp/wdraw',
+            'whatsapp/existing', 'whatsapp/preapproved', 'email/contract', 'email/drop',
+            'email/existing', 'email/preapproved', 'email/wdraw'
+        ) then 'portfolio'
+        when bai.source in ('ppc/simplic')
+            then 'ppc-brand'
+        when bai.source in (
+            'ppc/comp', 'ppc/credito-negativado', 'ppc/emprestimo', 'ppc/emprestimo-b',
+            'ppc/emprestimo-negativado', 'ppc/emprestimo-negativado-online',
+            'ppc/emprestimo-online', 'ppc/emprestimo-p', 'ppc/emprestimo-pessoal',
+            'ppc/emprestimo-rapido', 'ppc/emprestimo-pessoal-online'
+        ) then 'ppc-nonbrand'
+        when bai.source in (
+            'whatsapp-messenger', 'politica_de_privacidade', 'perguntas_frequentes',
+            'chat', 'como-funciona', 'fale-conosco', 'faq', 'quem_somos',
+            'simplic-emprestimo-seguro', 'termos', 'emprestimo-simplic-confiavel'
+        ) then 'seo brand'
+        when bai.source in (
+            'pix', 'cartao-credito', 'crefisa', 'emprestimo', 'emprestimo-banco-do-brasil',
+            'emprestimo-bmg', 'emprestimo-bradesco', 'emprestimo-caixa',
+            'emprestimo-consignado', 'emprestimo-facil', 'emprestimo-itau',
+            'emprestimo-online', 'emprestimo-para-aposentado',
+            'emprestimo-para-autonomo-negativado', 'emprestimo-para-negativado',
+            'emprestimo-para-negativado-assalariado', 'emprestimo-para-pensionista-inss',
+            'emprestimo-para-servidor-publico', 'emprestimo-pernambucanas',
+            'emprestimo-pessoal', 'emprestimo-santander', 'emprestimo-seguro',
+            'emprestimo-urgente', 'caixa', 'consulta-serasa-spc', 'itau',
+            'just-emprestimo', 'melhor-credito-pessoal', 'mobile-app',
+            'credito-negativado', 'mapa-do-site', 'vim'
+        ) then 'seo nonbrand'
+        when bai.source in (
+            'social/emprestimo-pessoal',
+            'social/emprestimo-para-negativado',
+            'facebook',
+            'instagram'
+        ) then 'social'
+        when bai.source in ('dis/goog-youtube', 'dis/youtube-video')
+            then 'youtube video'
+        else 'outro'
+    end as group_name,
+
+    lp_decision,
+    case when bli.returned_or_funding_failed_flag = 1 or loan_status = 'funding_failed' then 1 else 0 end as funding_failed_flag,
+    count(bai.loan_application_id) as app_count,
+    sum(case when bai.credit_model_version ilike '%new_v%' or bai.underwriting_decision_reason ilike '%prefilter_decline%' then 1 else 0 end) as underwritten,
+    sum(case when bai.credit_model_version ilike '%new_v%' then 1 else 0 end) as hit_cm,
+    sum(case when (last_ua.id is not null and bai.credit_model_version ilike '%new_v%') then 1 else 0 end) as underwriting_approved_by_final_models,
+    sum(case when last_cv.id is not null then 1 else 0 end) as contract_viewed,
+    sum(case when last_cs.id is not null then 1 else 0 end) as contract_signed,
+    sum(case when last_lp.id is not null then 1 else 0 end) as entered_lp,
+    sum(case when last_is.id is not null then 1 else 0 end) as issued,
+    sum(bli.funded_amount) as funded_amount
+
+from EIS_REPORTING_SF.NBOX_SIMPLIC_SOROCRED.BRAZIL_APP_INFORMATION bai
+left join ANALYTICS_DATASTORE.REPORTING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+    on a.loan_application_id = bai.loan_application_id
+left join EIS_REPORTING_SF.SIMPLIC_ANALYTICS.BRAZIL_LOANS_INFORMATION bli
+    on bli.loan_application_id = bai.loan_application_id
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_ua
+    on last_ua.loan_application_id = bai.loan_application_id
+   and last_ua.event = 'underwriting_approve'
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_cv
+    on last_cv.loan_application_id = bai.loan_application_id
+   and last_cv.event = 'ready_for_contract'
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_cs
+    on last_cs.loan_application_id = bai.loan_application_id
+   and last_cs.event = 'sign_contract'
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_lp
+    on last_lp.loan_application_id = bai.loan_application_id
+   and last_lp.event = 'entered_lp'
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_is
+    on last_is.loan_application_id = bai.loan_application_id
+   and last_is.event = 'issue'
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATIONS la
+    on bai.loan_application_id = la.loan_application_id
+
+where bai.customer_type = 'New'
+  and la.loan_application_status_id != 19
+  and bai.loan_application_date::date >= date_trunc('month', dateadd('month', -15, current_date()))
+  and bai.channel ilike '%organic%'
+
+group by
+    1,2,3,4,5,6,7,8,9"
+
+
+#ebs_auto <-dbGetQuery(brcon,qry)
+ebs_auto <- dbGetQuery(con, qry)
+
+
+gs4_auth(email = "eboscarriol@enova.com")
+
+ebs_auto %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/12ighblbZb81DQ1S0A__SYqzM8lmorU3AlooBlOIGxlQ/edit?gid=0#gid=0"),
+    sheet = "Base_volume"
+    
+  )
