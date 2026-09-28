@@ -1,0 +1,93 @@
+#library(googlesheets)
+library(XML)
+library(httr)
+library(jsonlite)
+#library(RPostgreSQL)
+#library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(DBI)
+library(odbc)
+
+# Conexão Snowflake
+con <- dbConnect(odbc::odbc(),
+                 Driver   = "SnowflakeDSIIDriver",   # depende do driver instalado
+                 Server   = "FRTUKBM-ENOVA.snowflakecomputing.com", # URL da sua instância
+                 UID      = "eboscarriol",
+                 authenticator = "externalbrowser",
+                 Database = "EIS_REPORTING_SF",
+                 Schema   = "PUBLIC",   # ajuste conforme necessário
+                 Warehouse= "REPORTING_WH", # ajuste conforme seu ambiente
+                 Role     = "EBOSCARRIOL_ROLE"   # opcional, depende da config do seu user
+)
+
+# Testar query
+dbGetQuery(con, "SELECT CURRENT_TIMESTAMP;")
+
+qry <-"select
+to_char(loan_application_date,'YYYY-MM-DD')::DATE as LOAN_APP_DATE,
+to_char(funded_date,'YYYY-MM-DD')::date as FUNDED_DATE,
+bai.customer_type,
+favorite_touch_agg,
+favorite_touch,
+favorite_campaign1,
+favorite_campaign2,
+bai.credit_tier,
+case when bli.returned_or_funding_failed_flag= 1 or loan_status = 'funding_failed' then 1 else 0 end as funding_failed_flag,
+count(bai.loan_application_id)                                                                         as loan_app_cnt,
+
+sum(case when bai.credit_model_version ilike '%new_v%' or bai.underwriting_decision_reason = 'simplic_hen1_prefilter_decline' or bai.underwriting_decision_reason = 'simplic_hen3_prefilter_decline' then 1 else 0 end) as underwritten,
+sum(case when (last_ua.id is not null and bai.credit_model_version ilike '%new_v%') then 1 else 0 end) as underwriting_approved_by_final_models,
+sum(case when last_cs.id is not null then 1 else 0 end) as contract_signed,
+
+sum(case when bli.operation_id is not null then 1 else 0 end) as issued,
+sum(bli.funded_amount)                                  AS funded_amount
+
+from EIS_REPORTING_SF.NBOX_SIMPLIC_SOROCRED.BRAZIL_APP_INFORMATION bai
+left join ANALYTICS_DATASTORE.REPORTING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+on a.loan_application_id = bai.loan_application_id
+left join EIS_REPORTING_SF.SIMPLIC_ANALYTICS.BRAZIL_LOANS_INFORMATION bli
+on bli.loan_application_id = bai.loan_application_id
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATIONS la
+on bai.loan_application_id = la.loan_application_id
+
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_ua
+on last_ua.loan_application_id = bai.loan_application_id
+and last_ua.event = 'underwriting_approve'
+
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_cs
+on last_cs.loan_application_id = bai.loan_application_id
+and last_cs.event = 'sign_contract'
+
+
+where 1 = 1
+and bai.loan_application_date::date >= date_trunc('month', add_months(current_date, -13))
+and bai.loan_application_date::date <= current_date
+and la.loan_application_status_id !=19
+and favorite_touch in ('display', 'ppc-brand', 'ppc-nonbrand')
+group by 1,2,3,4,5,6,7,8,9
+"
+
+
+#ebs_auto <-dbGetQuery(brcon,qry)
+# Consulta ao banco
+ebs_auto <- dbGetQuery(con, qry)
+
+# Autenticação Google Sheets
+gs4_auth(email = "eboscarriol@enova.com")
+
+# --- Atualiza a 1ª planilha ---
+write_sheet(
+  ebs_auto,
+  ss = gs4_get("https://docs.google.com/spreadsheets/d/1SLZoTxGNBwnPDhiRGuUFKOkhtLVI-GLT0bu08i3yZg4/edit#gid=0"),
+  sheet = "Application_KPIs"
+)
+
+# --- Atualiza a 2ª planilha ---
+#write_sheet(
+#  ebs_auto,
+#  ss = gs4_get("https://docs.google.com/spreadsheets/d/1G_UzT_fhBmaIhRKwvGW5TwVQZyQSR-D98jgxIsr0m2o/edit?gid=89032686#gid=89032686"),
+#  sheet = "Application_KPIs"
+#)
