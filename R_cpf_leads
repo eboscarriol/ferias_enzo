@@ -22,8 +22,7 @@ brcon = RPostgreSQL::dbConnect(  drv
                                  , host = "eis-reporting-masterdb.enova.com"
                                  , port = "5432")
 
-qry <-"
-select
+qry <-"select
 funded_date::Date as data_deposito,
 case when source in ('bompracredito', 'bompracreditompracredito','bompracredito_simplified_partners') then 'bompracredito'
 when source in ('easycredito1', 'easycredito') then 'easycredito'
@@ -43,29 +42,18 @@ on bli.loan_application_id = bai.loan_application_id
 
 left join simplic_portfolio.loan_applications la
 on bai.loan_application_id = la.loan_application_id
-where source in
-(
-  'bompracredito',
-  'bompracredito_simplified_partners',
-  'aff/bom-pra-credito-email',
-  'aff/easycredito',
-  'easycredito1',
-  'easycredito_simplified',
-  'ecred_simplified',
-  'finanzero_partner_simplified',
-  'finanzero_partner',
-  'finanzero',
-  'aff/idinheiro',
-  'aff/iq',
-  'iq_simplified',
-  'jurosbaixos',
-  'aff/jurosbaixos',
-  'kwai_simplified_partners',
-  'kwai_simplified',
-  'aff/kwai',
-  'querodinheiroagora_simplified',
-  'aff/noverde'
+where (
+     lower(bai.source) like '%kwai%'
+  or lower(bai.source) like '%jurosbaixos%'
+  or lower(bai.source) like '%finanzero%'
+  or lower(bai.source) like '%ecred%'
+  or lower(bai.source) like '%easycredito%'
+  or lower(bai.source) like '%bompracredito%'
+  or lower(bai.source) like '%noverde%'
+  or lower(bai.source) like '%iq%'
+  or lower(bai.source) like '%consumidorpositivo%'
 )
+
 --where source in ('aff/bom-pra-credito-email','bompracredito')
 and funded_date::date >= (current_date - interval'75 day')
 and bli.returned_or_funding_failed_flag!= 1
