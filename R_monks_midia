@@ -1,0 +1,1049 @@
+library(googlesheets4)
+library(dplyr)
+library(lubridate)
+library(DBI)
+library(odbc)
+library(tibble)
+
+# -----------------------------------------------------------------------------
+# 0. CONFIG
+# -----------------------------------------------------------------------------
+
+Sys.setenv(TZ = "America/Sao_Paulo")
+
+sheet_id <- "1nQCbWLpT-3657DpJ_rNbXCAM3jQTt9XrZnavd71Jvw0"
+
+# Primeira carga:
+# 14 meses anteriores + mês atual
+keep_months <- 14
+
+# Atualizações seguintes:
+# substitui somente os últimos 60 dias
+refresh_days <- 60
+
+sheet_loan   <- "Base de Dados - Emprestimos"
+sheet_google <- "Base de Dados - Google"
+sheet_log    <- "Log de Atualizacao"
+
+
+# -----------------------------------------------------------------------------
+# 1. FUNÇÕES AUXILIARES
+# -----------------------------------------------------------------------------
+
+# Converte número de coluna em letra:
+# 1 = A, 2 = B, 27 = AA etc.
+numero_para_coluna <- function(numero) {
+  
+  resultado <- ""
+  
+  while (numero > 0) {
+    
+    resto <- (numero - 1) %% 26
+    
+    resultado <- paste0(
+      LETTERS[resto + 1],
+      resultado
+    )
+    
+    numero <- (numero - 1) %/% 26
+  }
+  
+  resultado
+}
+
+
+# Converte datas lidas do Google Sheets
+converter_data_sheet <- function(x) {
+  
+  x <- as.character(x)
+  
+  resultado <- suppressWarnings(
+    as.Date(x)
+  )
+  
+  # Tenta formatos alternativos
+  linhas_nao_convertidas <- (
+    is.na(resultado) &
+      !is.na(x) &
+      x != ""
+  )
+  
+  if (any(linhas_nao_convertidas)) {
+    
+    resultado_alternativo <- suppressWarnings(
+      as.Date(
+        parse_date_time(
+          x[linhas_nao_convertidas],
+          orders = c(
+            "ymd",
+            "dmy",
+            "mdy"
+          )
+        )
+      )
+    )
+    
+    resultado[linhas_nao_convertidas] <- resultado_alternativo
+  }
+  
+  # Trata datas armazenadas como número serial
+  linhas_numericas <- (
+    is.na(resultado) &
+      grepl(
+        "^[0-9]+(\\.[0-9]+)?$",
+        x
+      )
+  )
+  
+  if (any(linhas_numericas)) {
+    
+    resultado[linhas_numericas] <- as.Date(
+      as.numeric(x[linhas_numericas]),
+      origin = "1899-12-30"
+    )
+  }
+  
+  resultado
+}
+
+
+# Valida se as datas estão ordenadas da mais antiga para a mais recente
+datas_estao_ordenadas <- function(datas) {
+  
+  datas_validas <- datas[!is.na(datas)]
+  
+  if (length(datas_validas) <= 1) {
+    return(TRUE)
+  }
+  
+  !is.unsorted(datas_validas)
+}
+
+
+# Lê somente a coluna de data da aba
+ler_coluna_data <- function(
+    sheet_name,
+    coluna_data_numero
+) {
+  
+  coluna_data_letra <- numero_para_coluna(
+    coluna_data_numero
+  )
+  
+  resultado <- range_read(
+    ss = sheet_id,
+    sheet = sheet_name,
+    range = paste0(
+      coluna_data_letra,
+      ":",
+      coluna_data_letra
+    ),
+    col_types = "c"
+  )
+  
+  if (
+    ncol(resultado) == 0 ||
+    nrow(resultado) == 0
+  ) {
+    
+    return(
+      tibble(
+        data = as.Date(character()),
+        linha_sheet = integer()
+      )
+    )
+  }
+  
+  tibble(
+    data = converter_data_sheet(
+      resultado[[1]]
+    ),
+    
+    # A primeira linha retornada é a linha 2,
+    # pois a linha 1 contém o cabeçalho
+    linha_sheet = seq_len(
+      nrow(resultado)
+    ) + 1
+  )
+}
+
+
+# Verifica se a aba existe e possui dados válidos
+aba_tem_dados <- function(
+    sheet_name,
+    coluna_data_numero
+) {
+  
+  abas_existentes <- sheet_names(
+    sheet_id
+  )
+  
+  if (!(sheet_name %in% abas_existentes)) {
+    return(FALSE)
+  }
+  
+  datas <- ler_coluna_data(
+    sheet_name = sheet_name,
+    coluna_data_numero = coluna_data_numero
+  )
+  
+  nrow(datas) > 0 &&
+    any(!is.na(datas$data))
+}
+
+
+# Verifica a ordenação da aba
+aba_esta_ordenada <- function(
+    sheet_name,
+    coluna_data_numero
+) {
+  
+  if (
+    !aba_tem_dados(
+      sheet_name = sheet_name,
+      coluna_data_numero = coluna_data_numero
+    )
+  ) {
+    return(TRUE)
+  }
+  
+  datas <- ler_coluna_data(
+    sheet_name = sheet_name,
+    coluna_data_numero = coluna_data_numero
+  )
+  
+  datas_estao_ordenadas(
+    datas$data
+  )
+}
+
+
+# Registra a execução na aba de log
+registrar_log <- function(
+    inicio,
+    fim,
+    status,
+    tipo_atualizacao,
+    linhas_loan = NA_integer_,
+    linhas_google = NA_integer_,
+    mensagem = NA_character_
+) {
+  
+  registro <- tibble(
+    inicio_execucao = format(
+      inicio,
+      "%Y-%m-%d %H:%M:%S"
+    ),
+    fim_execucao = format(
+      fim,
+      "%Y-%m-%d %H:%M:%S"
+    ),
+    duracao_minutos = round(
+      as.numeric(
+        difftime(
+          fim,
+          inicio,
+          units = "mins"
+        )
+      ),
+      2
+    ),
+    status = status,
+    tipo_atualizacao = tipo_atualizacao,
+    linhas_loan = linhas_loan,
+    linhas_google = linhas_google,
+    mensagem = mensagem
+  )
+  
+  abas_existentes <- sheet_names(
+    sheet_id
+  )
+  
+  if (!(sheet_log %in% abas_existentes)) {
+    
+    sheet_add(
+      ss = sheet_id,
+      sheet = sheet_log
+    )
+    
+    sheet_write(
+      data = registro,
+      ss = sheet_id,
+      sheet = sheet_log
+    )
+    
+  } else {
+    
+    sheet_append(
+      ss = sheet_id,
+      data = registro,
+      sheet = sheet_log
+    )
+  }
+}
+
+
+# Atualiza somente os últimos 60 dias
+atualizar_aba_incremental <- function(
+    dados_novos,
+    sheet_name,
+    coluna_data,
+    data_inicio_atualizacao
+) {
+  
+  # Garante que os dados novos estejam ordenados
+  dados_novos <- dados_novos %>%
+    arrange(
+      .data[[coluna_data]]
+    )
+  
+  coluna_data_numero <- match(
+    coluna_data,
+    names(dados_novos)
+  )
+  
+  if (is.na(coluna_data_numero)) {
+    
+    stop(
+      paste0(
+        "A coluna de data '",
+        coluna_data,
+        "' não foi encontrada nos dados."
+      )
+    )
+  }
+  
+  ultima_coluna <- numero_para_coluna(
+    ncol(dados_novos)
+  )
+  
+  # Lê a coluna de data atual
+  datas_atuais <- ler_coluna_data(
+    sheet_name = sheet_name,
+    coluna_data_numero = coluna_data_numero
+  )
+  
+  # Interrompe se a base não estiver ordenada
+  if (
+    !datas_estao_ordenadas(
+      datas_atuais$data
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "A aba '",
+        sheet_name,
+        "' não está ordenada da data mais antiga ",
+        "para a mais recente."
+      )
+    )
+  }
+  
+  # Localiza a primeira linha dos últimos 60 dias
+  linhas_recentes <- datas_atuais %>%
+    filter(
+      !is.na(data),
+      data >= data_inicio_atualizacao
+    )
+  
+  if (nrow(linhas_recentes) > 0) {
+    
+    primeira_linha_atualizacao <- min(
+      linhas_recentes$linha_sheet
+    )
+    
+  } else {
+    
+    # Caso não existam dados do período,
+    # escreve depois da última linha existente
+    primeira_linha_atualizacao <- nrow(
+      datas_atuais
+    ) + 2
+  }
+  
+  message(
+    sheet_name,
+    ": limpando dados a partir da linha ",
+    primeira_linha_atualizacao,
+    "."
+  )
+  
+  # Limpa todo o trecho a partir da primeira data recente.
+  # Como a aba está ordenada, esse trecho corresponde
+  # aos últimos 60 dias até o final da base.
+  range_clear(
+    ss = sheet_id,
+    sheet = sheet_name,
+    range = paste0(
+      "A",
+      primeira_linha_atualizacao,
+      ":",
+      ultima_coluna
+    )
+  )
+  
+  # Escreve novamente somente os últimos 60 dias
+  if (nrow(dados_novos) > 0) {
+    
+    message(
+      sheet_name,
+      ": escrevendo ",
+      format(
+        nrow(dados_novos),
+        big.mark = "."
+      ),
+      " linhas."
+    )
+    
+    range_write(
+      ss = sheet_id,
+      data = dados_novos,
+      sheet = sheet_name,
+      range = paste0(
+        "A",
+        primeira_linha_atualizacao
+      ),
+      col_names = FALSE
+    )
+  }
+  
+  # Validação final da ordenação
+  datas_finais <- ler_coluna_data(
+    sheet_name = sheet_name,
+    coluna_data_numero = coluna_data_numero
+  )
+  
+  if (
+    !datas_estao_ordenadas(
+      datas_finais$data
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "A aba '",
+        sheet_name,
+        "' não ficou ordenada após a atualização."
+      )
+    )
+  }
+  
+  message(
+    sheet_name,
+    ": atualização concluída e ordenação validada."
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# 2. INICIAR CONTROLE DA EXECUÇÃO
+# -----------------------------------------------------------------------------
+
+inicio_execucao <- Sys.time()
+
+status_execucao <- "Sucesso"
+mensagem_execucao <- NA_character_
+
+linhas_loan_log <- NA_integer_
+linhas_google_log <- NA_integer_
+
+tipo_atualizacao <- NA_character_
+
+con <- NULL
+
+
+# -----------------------------------------------------------------------------
+# 3. EXECUÇÃO PRINCIPAL
+# -----------------------------------------------------------------------------
+
+tryCatch({
+  
+  # ---------------------------------------------------------------------------
+  # 3A. AUTENTICAÇÃO
+  # ---------------------------------------------------------------------------
+  
+  con <- dbConnect(
+    odbc::odbc(),
+    Driver = "SnowflakeDSIIDriver",
+    Server = "FRTUKBM-ENOVA.snowflakecomputing.com",
+    UID = "eboscarriol",
+    authenticator = "externalbrowser",
+    Database = "EIS_REPORTING_SF",
+    Schema = "PUBLIC",
+    Warehouse = "REPORTING_WH",
+    Role = "EBOSCARRIOL_ROLE"
+  )
+  
+  gs4_auth(
+    email = "eboscarriol@enova.com"
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 3B. DEFINIR DATAS
+  # ---------------------------------------------------------------------------
+  
+  data_hoje <- Sys.Date()
+  
+  data_inicio_atualizacao <- data_hoje - refresh_days
+  
+  message(
+    "Data atual: ",
+    data_hoje
+  )
+  
+  message(
+    "Janela incremental: ",
+    data_inicio_atualizacao,
+    " até ",
+    data_hoje
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 3C. DEFINIR CARGA COMPLETA OU INCREMENTAL
+  # ---------------------------------------------------------------------------
+  
+  # Loans:
+  # data_pedido está na coluna A / coluna 1
+  loan_tem_dados <- aba_tem_dados(
+    sheet_name = sheet_loan,
+    coluna_data_numero = 1
+  )
+  
+  # Google Ads:
+  # segments_date está na coluna B / coluna 2
+  google_tem_dados <- aba_tem_dados(
+    sheet_name = sheet_google,
+    coluna_data_numero = 2
+  )
+  
+  carga_completa <- (
+    !loan_tem_dados ||
+      !google_tem_dados
+  )
+  
+  if (carga_completa) {
+    
+    tipo_atualizacao <- "Carga completa - 14 meses"
+    
+    message(
+      "Será realizada uma carga completa dos últimos ",
+      keep_months,
+      " meses."
+    )
+    
+  } else {
+    
+    tipo_atualizacao <- "Incremental - últimos 60 dias"
+    
+    message(
+      "Será realizada uma atualização incremental dos últimos ",
+      refresh_days,
+      " dias."
+    )
+    
+    # Antes de apagar qualquer dado,
+    # confirma que as abas estão ordenadas
+    if (
+      !aba_esta_ordenada(
+        sheet_name = sheet_loan,
+        coluna_data_numero = 1
+      )
+    ) {
+      
+      stop(
+        paste0(
+          "A aba '",
+          sheet_loan,
+          "' não está ordenada por data_pedido."
+        )
+      )
+    }
+    
+    if (
+      !aba_esta_ordenada(
+        sheet_name = sheet_google,
+        coluna_data_numero = 2
+      )
+    ) {
+      
+      stop(
+        paste0(
+          "A aba '",
+          sheet_google,
+          "' não está ordenada por segments_date."
+        )
+      )
+    }
+  }
+  
+  
+  # ---------------------------------------------------------------------------
+  # 3D. DEFINIR FILTROS DAS QUERIES
+  # ---------------------------------------------------------------------------
+  
+  if (carga_completa) {
+    
+    filtro_loan <- sprintf(
+      "
+      bai.loan_application_date >= DATEADD(
+          month,
+          -%d,
+          DATE_TRUNC('month', CURRENT_DATE())
+      )
+      ",
+      keep_months
+    )
+    
+    filtro_google <- sprintf(
+      "
+      SEGMENTS_DATE >= DATEADD(
+          month,
+          -%d,
+          DATE_TRUNC('month', CURRENT_DATE())
+      )
+      ",
+      keep_months
+    )
+    
+  } else {
+    
+    filtro_loan <- sprintf(
+      "
+      bai.loan_application_date >= DATEADD(
+          day,
+          -%d,
+          CURRENT_DATE()
+      )
+      ",
+      refresh_days
+    )
+    
+    filtro_google <- sprintf(
+      "
+      SEGMENTS_DATE >= DATEADD(
+          day,
+          -%d,
+          CURRENT_DATE()
+      )
+      ",
+      refresh_days
+    )
+  }
+  
+  
+  # ---------------------------------------------------------------------------
+  # 4. QUERY LOANS
+  # ---------------------------------------------------------------------------
+  
+  query_loan <- sprintf(
+    "
+    SELECT
+        bai.loan_application_date::DATE AS data_pedido,
+        TO_CHAR(bai.loan_application_date, 'YYYY') AS ano_pedido,
+        TO_CHAR(bai.loan_application_date, 'MM') AS mes_pedido,
+        TO_CHAR(bai.loan_application_date, 'DD') AS dia_pedido,
+
+        bli.funded_date::DATE AS data_deposito,
+        TO_CHAR(bli.funded_date, 'YYYY') AS ano_deposito,
+        TO_CHAR(bli.funded_date, 'MM') AS mes_deposito,
+        TO_CHAR(bli.funded_date, 'DD') AS dia_deposito,
+
+        bai.customer_type,
+        a.favorite_touch_agg,
+        a.favorite_touch,
+        a.favorite_campaign1,
+        a.favorite_campaign2,
+
+        CASE
+            WHEN ls.loan_status = 'funding_failed' THEN 1
+            ELSE 0
+        END AS deposito_falhou,
+
+        CASE
+            WHEN bai.credit_tier = 88 THEN 4
+            WHEN bai.credit_tier = 77 THEN 88
+            ELSE bai.credit_tier
+        END AS tier_credito,
+
+        COUNT(
+            bai.loan_application_id
+        ) AS pedidos_registrados,
+
+        SUM(
+            CASE
+                WHEN bli.operation_id IS NOT NULL THEN 1
+                ELSE 0
+            END
+        ) AS emprestimo_emitido,
+
+        SUM(
+            bli.funded_amount
+        ) AS valor_depositado
+
+    FROM EIS_REPORTING_SF.NBOX_SIMPLIC_SOROCRED.BRAZIL_APP_INFORMATION bai
+
+    LEFT JOIN ANALYTICS_DATASTORE.REPORTING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+        ON a.loan_application_id = bai.loan_application_id
+
+    LEFT JOIN EIS_REPORTING_SF.SIMPLIC_ANALYTICS.BRAZIL_LOANS_INFORMATION bli
+        ON bli.loan_application_id = bai.loan_application_id
+
+    LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATIONS la
+        ON bai.loan_application_id = la.loan_application_id
+
+    LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOANS lo
+        ON la.loan_number = lo.loan_number
+
+    LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_STATUSES ls
+        ON ls.loan_status_id = lo.loan_status_id
+
+    LEFT JOIN SORCERER_PROD.SORCERER.LOAN_APPLICATION_ATTRIBUTES laa
+        ON bai.loan_application_id = laa.loan_application_id
+
+    WHERE %s
+      AND bai.loan_application_date < DATEADD(
+          day,
+          1,
+          CURRENT_DATE()
+      )
+      AND la.loan_application_status_id != 19
+      AND bai.customer_type = 'New'
+      AND a.favorite_touch IN (
+          'ppc-nonbrand',
+          'ppc-brand',
+          'display'
+      )
+
+    GROUP BY
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15
+
+    ORDER BY
+        data_pedido ASC,
+        data_deposito ASC,
+        favorite_touch ASC
+    ",
+    filtro_loan
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 5. QUERY GOOGLE ADS
+  # ---------------------------------------------------------------------------
+  
+  query_google <- sprintf(
+    "
+    SELECT
+        CUSTOMER_DESCRIPTIVE_NAME,
+        SEGMENTS_DATE,
+        SEGMENTS_DAY_OF_WEEK,
+        SEGMENTS_MONTH,
+        SEGMENTS_WEEK,
+        SEGMENTS_YEAR,
+        UPDATED_ON,
+        CAMPAIGN_BIDDING_STRATEGY_TYPE,
+        CAMPAIGN_BUDGET_AMOUNT,
+        CAMPAIGN_BUDGET_PERIOD,
+        CAMPAIGN_ID,
+        CAMPAIGN_NAME,
+        CAMPAIGN_STATUS,
+
+        CASE
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%dgen%%' THEN 'Display'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%disp%%' THEN 'Display'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ppcb%%' THEN 'PPC-Brand'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ppcn%%' THEN 'PPC-nonbrand'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ytb%%' THEN 'Display'
+            ELSE 'PREENCHA'
+        END AS GOOGLE_GROUP1,
+
+        CASE
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%dgen%%' THEN 'DemandGen'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%disp%%' THEN 'Display'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ppcb%%' THEN 'PPC-Brand'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ppcn%%' THEN 'PPC-nonbrand'
+            WHEN LOWER(CAMPAIGN_NAME) LIKE '%%ytb%%' THEN 'Video'
+            ELSE 'PREENCHA'
+        END AS GOOGLE_GROUP2,
+
+        CUSTOMER_ID,
+        METRICS_AVERAGE_CPC,
+        METRICS_AVERAGE_CPM,
+        METRICS_CLICKS,
+        METRICS_CONVERSIONS,
+        METRICS_CONVERSIONS_FROM_INTERACTIONS_RATE,
+        METRICS_CONVERSIONS_VALUE,
+        METRICS_COST,
+        METRICS_COST_PER_CONVERSION,
+        METRICS_CTR,
+        METRICS_IMPRESSIONS,
+        ROW_ID,
+        SEGMENTS_AD_NETWORK_TYPE
+
+    FROM ANALYTICS_DATALAKE.GOOGLE_ADS.SIMPLIC_REPORT_CAMPAIGNS
+
+    WHERE %s
+      AND SEGMENTS_DATE <= CURRENT_DATE()
+
+    ORDER BY
+        SEGMENTS_DATE ASC,
+        CAMPAIGN_NAME ASC
+    ",
+    filtro_google
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 6. EXECUTAR QUERY LOANS
+  # ---------------------------------------------------------------------------
+  
+  message(
+    "Executando query de empréstimos..."
+  )
+  
+  base_loan <- dbGetQuery(
+    con,
+    query_loan
+  ) %>%
+    as_tibble() %>%
+    rename_with(tolower) %>%
+    mutate(
+      data_pedido = as.Date(
+        data_pedido
+      ),
+      data_deposito = as.Date(
+        data_deposito
+      )
+    ) %>%
+    arrange(
+      data_pedido,
+      data_deposito,
+      favorite_touch
+    )
+  
+  linhas_loan_log <- nrow(
+    base_loan
+  )
+  
+  message(
+    "Query de empréstimos concluída: ",
+    format(
+      linhas_loan_log,
+      big.mark = "."
+    ),
+    " linhas."
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 7. EXECUTAR QUERY GOOGLE ADS
+  # ---------------------------------------------------------------------------
+  
+  message(
+    "Executando query do Google Ads..."
+  )
+  
+  base_google <- dbGetQuery(
+    con,
+    query_google
+  ) %>%
+    as_tibble() %>%
+    rename_with(tolower) %>%
+    mutate(
+      segments_date = as.Date(
+        segments_date
+      )
+    ) %>%
+    arrange(
+      segments_date,
+      campaign_name
+    )
+  
+  linhas_google_log <- nrow(
+    base_google
+  )
+  
+  message(
+    "Query do Google Ads concluída: ",
+    format(
+      linhas_google_log,
+      big.mark = "."
+    ),
+    " linhas."
+  )
+  
+  
+  # ---------------------------------------------------------------------------
+  # 8. ATUALIZAR GOOGLE SHEETS
+  # ---------------------------------------------------------------------------
+  
+  if (carga_completa) {
+    
+    # -------------------------------------------------------------------------
+    # PRIMEIRA CARGA
+    # -------------------------------------------------------------------------
+    
+    message(
+      "Realizando carga completa da aba: ",
+      sheet_loan
+    )
+    
+    sheet_write(
+      data = base_loan,
+      ss = sheet_id,
+      sheet = sheet_loan
+    )
+    
+    message(
+      "Realizando carga completa da aba: ",
+      sheet_google
+    )
+    
+    sheet_write(
+      data = base_google,
+      ss = sheet_id,
+      sheet = sheet_google
+    )
+    
+  } else {
+    
+    # -------------------------------------------------------------------------
+    # ATUALIZAÇÃO INCREMENTAL
+    # -------------------------------------------------------------------------
+    
+    message(
+      "Atualizando os últimos ",
+      refresh_days,
+      " dias da aba: ",
+      sheet_loan
+    )
+    
+    atualizar_aba_incremental(
+      dados_novos = base_loan,
+      sheet_name = sheet_loan,
+      coluna_data = "data_pedido",
+      data_inicio_atualizacao = data_inicio_atualizacao
+    )
+    
+    message(
+      "Atualizando os últimos ",
+      refresh_days,
+      " dias da aba: ",
+      sheet_google
+    )
+    
+    atualizar_aba_incremental(
+      dados_novos = base_google,
+      sheet_name = sheet_google,
+      coluna_data = "segments_date",
+      data_inicio_atualizacao = data_inicio_atualizacao
+    )
+  }
+  
+  
+  # ---------------------------------------------------------------------------
+  # 9. VALIDAÇÃO FINAL
+  # ---------------------------------------------------------------------------
+  
+  if (
+    !aba_esta_ordenada(
+      sheet_name = sheet_loan,
+      coluna_data_numero = 1
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "A aba '",
+        sheet_loan,
+        "' não está ordenada por data_pedido."
+      )
+    )
+  }
+  
+  if (
+    !aba_esta_ordenada(
+      sheet_name = sheet_google,
+      coluna_data_numero = 2
+    )
+  ) {
+    
+    stop(
+      paste0(
+        "A aba '",
+        sheet_google,
+        "' não está ordenada por segments_date."
+      )
+    )
+  }
+  
+  message(
+    "Ordenação das duas abas validada com sucesso."
+  )
+  
+}, error = function(e) {
+  
+  status_execucao <<- "Erro"
+  
+  mensagem_execucao <<- conditionMessage(
+    e
+  )
+  
+  message(
+    "Erro durante a atualização: ",
+    mensagem_execucao
+  )
+  
+}, finally = {
+  
+  fim_execucao <- Sys.time()
+  
+  # ---------------------------------------------------------------------------
+  # 10. REGISTRAR LOG
+  # ---------------------------------------------------------------------------
+  
+  tryCatch({
+    
+    registrar_log(
+      inicio = inicio_execucao,
+      fim = fim_execucao,
+      status = status_execucao,
+      tipo_atualizacao = tipo_atualizacao,
+      linhas_loan = linhas_loan_log,
+      linhas_google = linhas_google_log,
+      mensagem = mensagem_execucao
+    )
+    
+  }, error = function(e) {
+    
+    message(
+      "Não foi possível registrar o log: ",
+      conditionMessage(e)
+    )
+  })
+  
+  
+  # ---------------------------------------------------------------------------
+  # 11. ENCERRAR CONEXÃO
+  # ---------------------------------------------------------------------------
+  
+  if (
+    !is.null(con) &&
+    DBI::dbIsValid(con)
+  ) {
+    
+    dbDisconnect(
+      con
+    )
+  }
+  
+  message(
+    "Execução finalizada com status: ",
+    status_execucao
+  )
+})
