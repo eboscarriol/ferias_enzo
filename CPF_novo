@@ -1,0 +1,101 @@
+# =========================================================
+# SCRIPT — ISSUED LEADS
+# =========================================================
+# -------------------------
+# LIBRARIES
+# -------------------------
+library(XML)
+library(httr)
+library(jsonlite)
+library(RPostgreSQL)
+library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+# -------------------------
+# DATABASE CONNECTION
+# -------------------------
+brcon <- dbConnect(
+  odbc::odbc(),
+  Driver        = "SnowflakeDSIIDriver",
+  Server        = "FRTUKBM-ENOVA.snowflakecomputing.com",
+  UID           = "eboscarriol",
+  authenticator = "externalbrowser",
+  Database      = "EIS_REPORTING_SF",
+  Schema        = "PUBLIC",
+  Warehouse     = "REPORTING_WH",
+  Role          = "EBOSCARRIOL_ROLE"
+)
+# -------------------------
+# GOOGLE SHEETS AUTH
+# -------------------------
+gs4_auth(email = "eboscarriol@enova.com")
+# =========================================================
+# ISSUED LEADS
+# =========================================================
+qry_issued_leads <- "
+select
+funded_date::Date as funded_date,
+bai.customer_type,
+channel,
+source, 
+case 
+    when channel != 'organic'
+         or (channel = 'organic' and source like 'aff%')
+    then
+        case 
+            when source like '%aro%' then 'aro-credito'
+            when source like '%bompracredito%' then 'bompracredito'
+             when ((source ilike '%iq%' and source not ilike '%rcs%') or source ilike '%consumidor%') then 'consumidor-positivo'
+            when source like '%ecred%' then 'ecred'
+            when source like '%easy%' then 'easycredito'
+            when source like '%finanzero%' then 'finanzero'
+            when source like '%juros%' then 'jurosbaixos'
+            when source like '%kwai%' then 'kwai'
+            when source like '%noverde%' then 'noverde'
+            when source like '%quitar%' then 'quero-quitar'
+            else source 
+        end
+    else null
+end as source_agrupada,
+favorite_touch_agg,
+favorite_touch,
+-- case when bli.returned_or_funding_failed_flag= 1 or loan_status = 'funding_failed' then 'sim'
+-- else 'nao' end as devolvido_banco,
+sum(case when bli.operation_id is not null then 1 else 0 end) as emprestimo_emitido,
+sum(bli.funded_amount) as valor_depositado
+from EIS_REPORTING_SF.NBOX_SIMPLIC_SOROCRED.BRAZIL_APP_INFORMATION bai
+left join ANALYTICS_DATASTORE.REPORTING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+on a.loan_application_id = bai.loan_application_id
+left join EIS_REPORTING_SF.SIMPLIC_ANALYTICS.BRAZIL_LOANS_INFORMATION bli
+on bli.loan_application_id = bai.loan_application_id
+left join SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATIONS la
+on bai.loan_application_id = la.loan_application_id
+where 1=1
+and funded_date::date >= (current_date - interval'90 day')
+--and funded_date::date >= '2024-12-30'
+and bli.returned_or_funding_failed_flag != 1
+and loan_status != 'funding_failed'
+and la.loan_application_status_id != 19
+group by 1,2,3,4,5,6,7
+order by 1 DESC
+"
+# -------------------------
+# EXECUTE QUERY
+# -------------------------
+issued_leads <- dbGetQuery(brcon, qry_issued_leads)
+# -------------------------
+# WRITE TO GOOGLE SHEETS
+# -------------------------
+write_sheet(
+  issued_leads,
+  ss = gs4_get(
+    "https://docs.google.com/spreadsheets/d/1jHW-IawW-RzXJbdK-vjizolUxlLIAl6dMnxBfnNq-S0/edit?gid=1265691451#gid=1265691451"
+  ),
+  sheet = "R_issued"
+)
+# -------------------------
+# CLOSE CONNECTION
+# -------------------------
+dbDisconnect(brcon)
