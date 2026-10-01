@@ -1,0 +1,218 @@
+#library(googlesheets)
+library(XML)
+library(httr)
+library(jsonlite)
+#library(RPostgreSQL)
+#library(RPostgres)
+library(googlesheets4)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(DBI)
+library(odbc)
+
+# Conexão Snowflake
+con <- dbConnect(odbc::odbc(),
+                 Driver   = "SnowflakeDSIIDriver",   # depende do driver instalado
+                 Server   = "FRTUKBM-ENOVA.snowflakecomputing.com", # URL da sua instância
+                 UID      = "eboscarriol",
+                 authenticator = "externalbrowser",
+                 Database = "EIS_REPORTING_SF",
+                 Schema   = "PUBLIC",   # ajuste conforme necessário
+                 Warehouse= "REPORTING_WH", # ajuste conforme seu ambiente
+                 Role     = "EBOSCARRIOL_ROLE"   # opcional, depende da config do seu user
+)
+
+qry <-"
+-- Query principal
+SELECT
+    to_char(loan_application_date,'YYYY-MM-DD')::DATE as LOAN_APP_DATE,
+    CASE
+        WHEN DAYOFWEEK(loan_application_date) IN (1, 7) THEN 'weekend'  -- 1 = Sunday, 7 = Saturday
+        ELSE 'weekday'
+    END AS day_type,
+    --to_char(loan_application_date, 'DD') as LOAN_APP_DAY,
+    --to_char(loan_application_date, 'MM') as LOAN_APP_MONTH,
+    --to_char(loan_application_date, 'YYYY') as LOAN_APP_YEAR,
+    to_char(funded_date,'YYYY-MM-DD')::date as FUNDED_DATE,
+    --to_char(funded_date,'DD') as FUNDED_DAY,
+    --to_char(funded_date,'MM') as FUNDED_MONTH,
+    --to_char(funded_date,'YYYY') as FUNDED_YEAR,
+    bai.customer_type,
+    bai.channel,
+    CASE
+    WHEN bai.source LIKE '%ecred%' THEN 'Ecred agg'
+    when bai.source LIKE '%aff/ecred%' THEN 'Ecred agg'
+
+    WHEN bai.source LIKE '%finanzero%' THEN 'Finanzero agg'
+    when bai.source LIKE '%aff/finanzero%' THEN 'Finanzero agg'
+
+    WHEN bai.source LIKE '%jurosbaixos%' THEN 'JurosBaixos agg'
+    when bai.source LIKE '%aff/juros%' THEN 'JurosBaixos agg'
+
+    WHEN bai.source LIKE '%easycredito%' THEN 'EasyCredito agg'
+    when bai.source LIKE '%aff/easy%' THEN 'EasyCredito agg'
+
+    WHEN bai.source LIKE '%iq%' THEN 'IQ-ConsumidorPositivo agg'
+    when bai.source LIKE '%aff/iq%' THEN 'IQ-ConsumidorPositivo agg'
+    WHEN bai.source LIKE '%consumidorpositivo%' THEN 'IQ-ConsumidorPositivo agg'
+
+    WHEN bai.source LIKE '%bompracredito%' THEN 'BomPraCredito agg'
+    when bai.source LIKE '%aff/bom%' THEN 'BomPraCredito agg'
+
+    WHEN bai.source LIKE '%kwai%' THEN 'Kwai agg'
+    when bai.source LIKE '%aff/kwai%' THEN 'Kwai agg'
+
+    WHEN bai.source LIKE '%noverde%' THEN 'Noverde agg'
+    when bai.source LIKE '%aff/noverde%' THEN 'Noverde agg'
+
+    WHEN bai.source LIKE '%mobills%' THEN 'Mobills agg'
+    when bai.source LIKE '%aff/mobills%' THEN 'Mobills agg'
+
+    WHEN bai.source LIKE '%whatsapp%' THEN 'WhatsApp agg'
+    when bai.source LIKE '%aff/whatsapp%' THEN 'WhatsApp agg'
+
+    ELSE 'others'
+END AS provider_standardized,
+    bai.source,
+    --bank_name as banco,
+    --CASE
+      --  WHEN underwriting_decision_reason IN ('simplic_credit_model_decline', 'simplic_hen1_prefilter_decline','simplic_hen3_prefilter_decline')
+      --      THEN 'declinado pós elegibilidade'
+      --  WHEN underwriting_decision_reason = 'suitable_loan_offers_generated'
+      --      THEN 'recebeu oferta'
+      --  WHEN underwriting_decision_reason ILIKE '%ebs_underwriting%'
+      --      THEN 'fluxo_ebs'
+      --  WHEN underwriting_decision_reason = 'simplic_duplicate_phone_number_decline'
+      --      THEN 'declinado por elegibilidade (phone duplicated)'
+      --  WHEN underwriting_decision_reason IN ('simplic_past_underwriting_declined', 'past_ebs_declined', 'simplic_past_lp_declined')
+      --      THEN 'declinado por elegibilidade (past declined)'
+      --  WHEN underwriting_decision_reason = 'simplic_duplicate_bank_account_decline'
+      --      THEN 'declinado por elegibilidade (bank duplicated)'
+      --  WHEN underwriting_decision_reason = 'simplic_iovation_decline'
+      --      THEN 'declinado por elegibilidade (iovation declined)'
+      --  WHEN underwriting_decision_reason = 'simplic_income_decline'
+      --      THEN 'declinado por elegibilidade (income declined)'
+      --  WHEN underwriting_decision_reason = 'simplic_funding_paused'
+      --      THEN 'declinado por elegibilidade (funding paused)'
+      --  WHEN underwriting_decision_reason = 'cool_off_period'
+      --      THEN 'declinado por elegibilidade (cool off)'
+      --      WHEN underwriting_decision_reason = 'no_loan_offers'
+      --      THEN 'declinado por falta de oferta (no loan offer)'
+      --  ELSE 'others'
+    --END AS underwriting_category,
+    --underwriting_decision_reason,
+    --CASE
+      --  WHEN credit_score IS NULL THEN 'Sem score'
+      --  WHEN credit_score < 0.10 THEN '0.00 - 0.10'
+      --  WHEN credit_score < 0.20 THEN '0.10 - 0.20'
+      --  WHEN credit_score < 0.30 THEN '0.20 - 0.30'
+      --  WHEN credit_score < 0.40 THEN '0.30 - 0.40'
+      --  WHEN credit_score < 0.50 THEN '0.40 - 0.50'
+      --  WHEN credit_score < 0.60 THEN '0.50 - 0.60'
+      --  WHEN credit_score < 0.70 THEN '0.60 - 0.70'
+      --  WHEN credit_score < 0.80 THEN '0.70 - 0.80'
+      --  WHEN credit_score < 0.90 THEN '0.80 - 0.90'
+      --  WHEN credit_score <= 1.00 THEN '0.90 - 1.00'
+      --  ELSE 'Fora da faixa (0-1)'
+    --END AS credit_score_bucket,
+    --credit_model_version,
+    credit_tier,
+    --CASE
+    --    WHEN monthly_net_income BETWEEN 0 AND 1500 THEN '1. 0-1500'
+    --    WHEN monthly_net_income BETWEEN 1501 AND 3000 THEN '2. 1501-3000'
+    --    WHEN monthly_net_income BETWEEN 3001 AND 5000 THEN '3. 3001-5000'
+    --    WHEN monthly_net_income BETWEEN 5001 AND 7000 THEN '4. 5001-7000'
+    --    WHEN monthly_net_income BETWEEN 7001 AND 10000 THEN '5. 7001-10000'
+    --    WHEN monthly_net_income > 10000 THEN '6. +10000'
+    --    ELSE 'não informado'
+    --END AS faixa_renda,
+    CASE
+        WHEN returned_or_funding_failed_flag = 1 OR loan_status = 'funding_failed' THEN 1
+        ELSE 0
+    END AS funding_failed_flag,
+    COUNT(bai.loan_application_id) AS loan_app_cnt,
+    sUM(
+    CASE
+        WHEN credit_model_version ILIKE '%new_v%'
+             OR underwriting_decision_reason IN (
+                 'simplic_hen1_prefilter_decline',
+                 'simplic_hen3_prefilter_decline'
+             )
+        THEN 1
+        ELSE 0
+    END
+) AS underwritten,
+    SUM(CASE WHEN last_ua.id IS NOT NULL THEN 1 ELSE 0 END) AS underwriting_approved,
+SUM(
+  CASE
+    WHEN (
+      credit_model_version ILIKE '%new_v%'
+      OR credit_model_version ILIKE '%existing_v%'
+    )
+    THEN 1
+    ELSE 0
+  END
+) AS hit_cm,
+
+    SUM(
+  CASE
+    WHEN (
+      last_ua.id IS NOT NULL
+      AND (
+        credit_model_version ILIKE '%new_v%'
+        OR credit_model_version ILIKE '%existing_v%'
+      )
+    )
+    THEN 1
+    ELSE 0
+  END
+) AS underwriting_approved_by_final_models,
+
+    SUM(CASE WHEN last_cs.id IS NOT NULL THEN 1 ELSE 0 END) AS contract_signed,
+    SUM(CASE WHEN bli.operation_id IS NOT NULL THEN 1 ELSE 0 END) AS issued,
+    SUM(bli.funded_amount) AS funded_amount
+FROM EIS_REPORTING_SF.NBOX_SIMPLIC_SOROCRED.BRAZIL_APP_INFORMATION bai
+LEFT JOIN ANALYTICS_DATASTORE.REPORTING.MKT_SIMPLIC_ADOBE_FAV_TOUCH_ATTRIBUTION_FACT a
+    ON a.loan_application_id = bai.loan_application_id
+LEFT JOIN EIS_REPORTING_SF.SIMPLIC_ANALYTICS.BRAZIL_LOANS_INFORMATION bli
+    ON bli.loan_application_id = bai.loan_application_id
+LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_ua
+    ON last_ua.loan_application_id = bai.loan_application_id
+    AND last_ua.event = 'underwriting_approve'
+LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_cv
+    ON last_cv.loan_application_id = bai.loan_application_id
+    AND last_cv.event = 'ready_for_contract'
+LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATION_STATE_TRANSITIONS last_cs
+    ON last_cs.loan_application_id = bai.loan_application_id
+    AND last_cs.event = 'sign_contract'
+LEFT JOIN SIMPLIC_PORTFOLIO_PROD.SIMPLIC_PORTFOLIO.LOAN_APPLICATIONS la
+    ON bai.loan_application_id = la.loan_application_id
+where loan_application_date::date >= '2024-12-20' --and loan_application_date::date <= '2025-04-10'
+  AND la.loan_application_status_id != 19
+
+  -- player especifico
+--  and bai.source  in ('ecred_simplified')
+
+  -- all players
+  -- and bai.source in (   'bompracredito',   'easycredito_simplified',   'ecred_simplified',   'finanzero',   'jurosbaixos',   'whatsapp_inbound',   'bompracredito_simplified_partners',   'finanzero_partner',   'kwai_simplified_partners',   'consumidorpositivo_simplified',   'aff/bom-pra-credito',   'aff/easycredito',   'aff/iq',   'aff/jurosbaixos',   'aff/kwai',   'aff/noverde'   )
+
+  -- top players sem ecred:
+and bai.source in (   'bompracredito',   'easycredito_simplified', 'finanzero',   'jurosbaixos',   'bompracredito_simplified_partners',   'finanzero_partner',   'kwai_simplified_partners',   'consumidorpositivo_simplified',   'aff/bom-pra-credito',   'aff/easycredito',   'aff/iq',   'aff/jurosbaixos',   'aff/kwai'  )
+GROUP BY 1,2,3,4,5,6,7,8,9--,10,11,12,13,14,15--,16,17,18,19
+"
+
+#ebs_auto <-dbGetQuery(brcon,qry)
+
+# Consulta ao banco
+ebs_auto <- dbGetQuery(con, qry)
+
+# Autenticação Google Sheets
+gs4_auth(email = "eboscarriol@enova.com")
+
+# --- Atualiza a 1ª planilha ---
+write_sheet(
+  ebs_auto,
+  ss = gs4_get("https://docs.google.com/spreadsheets/d/1HANQHgs8Ioo08u8acHmUvuMxvCM_TVwmSuGyIUctfi8/edit?gid=144481393#gid=144481393"),
+  sheet = "base_applications"
+)
